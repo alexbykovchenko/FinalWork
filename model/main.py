@@ -22,7 +22,6 @@ class Form ( BaseModel ):
     device_category:  str
     device_os:        str
     device_brand:     str
-    device_model:     str
     device_browser:   str
     device_screen_resolution: str
     geo_country:      str
@@ -79,7 +78,8 @@ def predict(form: Form):
 
     df.drop(['device_screen_resolution'], axis=1, inplace=True)
 
-    #  Предсказание зависит от даты и времени  Для теста положительного  предсказания можно использовать:
+    #  Предсказание зависит от даты и времени  Для pred=1  предсказания можно использовать:
+
     # df['visit_number'] = 1
     # df['month'] = 6
     # df['day_of_week'] = 0

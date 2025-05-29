@@ -52,6 +52,39 @@ def load_data(sessions_path: str, hits_path: str) -> pd.DataFrame:
     return merged
 
 
+def clip_outliers(X: pd.DataFrame) -> pd.DataFrame:
+    import pandas as pd
+    from typing import Tuple
+    """Обрабатывает выбросы в числовых признаках с помощью метода IQR."""
+    X = X.copy()
+
+    def get_iqr_bounds(data: pd.Series) -> Tuple[float, float]:
+        """Вложенная функция для расчета границ IQR."""
+        Q1 = data.quantile(0.25)
+        Q3 = data.quantile(0.75)
+        IQR = Q3 - Q1
+
+        lower_bound = Q1 - 1.5 * IQR
+        upper_bound = Q3 + 1.5 * IQR
+
+        if lower_bound < 1:
+            lower_bound = 1
+
+        return float(lower_bound), float(upper_bound)
+
+    # Обрабатываем screen_pixels если он есть
+    if 'screen_pixels' in X.columns:
+        lower, upper = get_iqr_bounds(X['screen_pixels'])
+        X['screen_pixels'] = X['screen_pixels'].clip(lower=lower, upper=upper)
+
+    # Обрабатываем visit_number если он есть
+    if 'visit_number' in X.columns:
+        lower, upper = get_iqr_bounds(X['visit_number'])
+        X['visit_number'] = X['visit_number'].clip(lower=lower, upper=upper)
+
+    return X
+
+
 def create_temporal_features(X: pd.DataFrame) -> pd.DataFrame:
     import pandas as pd
     """Создает временные признаки из даты и времени визита."""
@@ -60,13 +93,11 @@ def create_temporal_features(X: pd.DataFrame) -> pd.DataFrame:
     if not all(col in X.columns for col in ['visit_date', 'visit_time']):
         return X
 
-
     dt = pd.to_datetime(X['visit_date'])
     X['month'] = dt.dt.month.astype(np.int8)
     X['day_of_week'] = dt.dt.dayofweek.astype(np.int8)
     X['quarter'] = dt.dt.quarter.astype(np.int8)
     X['week_in_month'] = ((dt.dt.day - 1) // 7 + 1).astype(np.int8)
-
 
     hour = pd.to_datetime(X['visit_time'], format='%H:%M:%S').dt.hour.astype(np.int8)
     X['hour'] = hour
@@ -79,8 +110,6 @@ def create_temporal_features(X: pd.DataFrame) -> pd.DataFrame:
     return X
 
 
-
-
 def process_screen_resolution(X: pd.DataFrame) -> pd.DataFrame:
     """Обрабатывает разрешение экрана, преобразуя его в количество пикселей."""
     X = X.copy()
@@ -91,6 +120,56 @@ def process_screen_resolution(X: pd.DataFrame) -> pd.DataFrame:
     X['screen_pixels'] = X['device_screen_resolution'].apply(
         lambda x: int(x.split('x')[0]) * int(x.split('x')[1]) if isinstance(x, str) and 'x' in x else np.nan
     ).astype(np.float32)
+
+    return X
+
+
+def process_device_brand(X: pd.DataFrame) -> pd.DataFrame:
+    import pandas as pd
+    """Обрабатывает device_brand, заменя (not set) на самый популярный бренд для данной категории."""
+    X = X.copy()
+
+    if not all(col in X.columns for col in ['device_brand', 'device_category']):
+        return X
+
+    # Заменяем (not set) на NA
+    X['device_brand'] = X['device_brand'].replace('(not set)', pd.NA)
+
+    # Находим самые популярные бренды для каждой категории
+    filtered_df = X[['device_category', 'device_brand']].copy()
+    popular_brands = filtered_df.groupby(['device_category', 'device_brand']).size().reset_index(name='count')
+    popular_brands = popular_brands.loc[popular_brands.groupby('device_category')['count'].idxmax()]
+
+    # Создаем словарь для замены
+    brand_mapping = popular_brands.set_index('device_category')['device_brand'].to_dict()
+
+    # Заполняем пропущенные значения
+    X['device_brand'] = X.apply(
+        lambda row: brand_mapping.get(row['device_category'], 'unknown')
+        if pd.isna(row['device_brand'])
+        else row['device_brand'],
+        axis=1
+    )
+
+    return X
+
+
+def process_device_os(X: pd.DataFrame) -> pd.DataFrame:
+    """Заполняет пропуски в device_os на основе самого частого ОС для данного бренда."""
+    X = X.copy()
+
+    if not all(col in X.columns for col in ['device_brand', 'device_os']):
+        return X
+
+    # Создаем mapping между брендом и самой частой ОС
+    filtered_df = X[['device_brand', 'device_os']].dropna(subset=['device_brand'])
+    brand_os_mapping = filtered_df.groupby('device_brand')['device_os'].first().to_dict()
+
+    # Заполняем пропущенные значения в device_os
+    X['device_os'] = X.apply(
+        lambda row: brand_os_mapping.get(row['device_brand'], row['device_os']),
+        axis=1
+    )
 
     return X
 
@@ -112,18 +191,10 @@ def remove_unused_columns(X: pd.DataFrame) -> pd.DataFrame:
     if 'client_id' in X.columns:
         cols_to_drop.append('client_id')
 
-    return X.drop(cols_to_drop, axis=1, errors='ignore')
-
-
-def clean_data(X: pd.DataFrame) -> pd.DataFrame:
-    """Очищает данные: заполняет пропуски и обрабатывает категориальные признаки."""
-    X = X.copy()
-
     if 'device_model' in X.columns:
-        # Просто преобразуем в строку, затем заполняем и делаем категорией
-        X['device_model'] = X['device_model'].astype(str).fillna('other').astype('category')
+        cols_to_drop.append('device_model')
 
-    return X
+    return X.drop(cols_to_drop, axis=1, errors='ignore')
 
 
 def build_feature_pipeline() -> Pipeline:
@@ -131,8 +202,10 @@ def build_feature_pipeline() -> Pipeline:
     return Pipeline([
         ('temporal_features', FunctionTransformer(create_temporal_features)),
         ('screen_resolution', FunctionTransformer(process_screen_resolution)),
+        ('process_device_brand', FunctionTransformer(process_device_brand)),
+        ('process_device_os', FunctionTransformer(process_device_os)),
+        ('clip_outliers', FunctionTransformer(clip_outliers)),
         ('remove_columns', FunctionTransformer(remove_unused_columns)),
-        ('cleaning', FunctionTransformer(clean_data)),
     ])
 
 
@@ -142,7 +215,7 @@ def get_actual_features(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
     sample_features = feature_pipeline.fit_transform(df.head())
 
     expected_numerical = ['month', 'day_of_week', 'hour', 'time_of_day',
-                          'quarter', 'week_in_month', 'screen_pixels']
+                          'quarter', 'week_in_month', 'screen_pixels', 'visit_number']
     numerical = [col for col in expected_numerical if col in sample_features.columns]
 
     categorical = [col for col in sample_features.columns
